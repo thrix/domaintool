@@ -1,0 +1,406 @@
+#!/bin/bash
+#
+# Simple domain management script
+# Author: thrix
+# Date: 2012-2014
+#
+
+# vars
+DTNAME=$(basename $0)
+DTOP=$1
+DTDOMAIN=$2
+DTTEMPLATE_NAME="template.conf"
+DTTEMPLATE="/etc/${DTNAME}/${DTTEMPLATE_NAME}"
+APACHECONF="$(find /etc/ -name apache2.conf -or -name httpd.conf | head -1)"
+APACHECTL="$(which apachectl apache2ctl 2>/dev/null)"
+DTCONFIG="/etc/${DTNAME}/${DTNAME}.conf"
+INSTALL_PATH="/usr/sbin"
+ENABLED_SITES="domaintool-sites"
+DISABLED_SITES="domaintool-sites-disabled"
+
+# defaults
+DEF_DTPATH="/www"
+DEF_DTBASICAUTH="$DEF_DTPATH/domainpass"
+DEF_DTAPACHEDIR="$(echo $APACHECONF | grep -o '/etc/[[:alpha:]]*')"
+
+exit_error() {
+    printf "Error: $@\n"
+    exit 1
+}
+
+check_deps() {
+    [ "$(which apachectl apache2ctl 2>/dev/null)" == 2 ] && \
+        exit_error "Apache not found - no apachectl or apache2ctl found in $PATH"
+
+    [ "$(find /etc/ -name my.cnf 2>/dev/null | wc -l)" -eq 0 ] && \
+        exit_error "MySQL does not seem to be installed, no my.cnf found in /etc"
+}
+
+ask() {
+    local ANS= DEFAULT="$2"
+
+    # make sure we get a value when no default
+    while [ -z "$ANS" ]; do
+        [ -z "$DEFAULT" ] && echo -n "$1: " >/dev/tty || \
+            echo -n "$1 [$DEFAULT]: " >/dev/tty
+        read ANS
+        [ -z "$ANS" ] && ANS="$DEFAULT"
+    done
+ 
+    echo "$ANS"
+}
+
+sanity_checks() {
+    # check if we are root
+    if [ "$(whoami)" != root ]; then 
+        echo "Domaintool needs root. Rerun with sudo or as root."
+        exit 1
+    fi
+
+    # check dependencies installed
+    check_deps
+
+    # pop out if installation
+    [ "$DTOP" = "install" ] && return
+
+    # check if tool installed 
+    [ -e "$DTCONFIG" ] || exit_error "$DTNAME is not installed, run install"
+
+    # source the configuration
+    source $DTCONFIG
+
+    # setup enabled/disabled sites
+    DTENABLED_SITES=${DTAPACHEDIR}/${ENABLED_SITES}
+    DTDISABLED_SITES=${DTAPACHEDIR}/${DISABLED_SITES}
+
+    # check all required options
+    for VAR in DTPATH DTAPACHEDIR DTTEMPLATE DTMYUSER DTMYPASS; do
+        [ -z "$(eval echo \$$VAR)" ] && \
+            exit_error "Missing required variable $VAR in configuration."
+    done
+
+    # check if domain name supplied
+    if [ "$DTDOMAIN" = "" ] && [ "$DTOP" != "list" ]; then
+        echo "Please provide operation and domain name"
+        echo
+        print_help
+        exit 1
+    fi
+}
+
+operation_install() {
+    # pop out if already installed
+    [ -e "$DTCONFIG" ] && exit_error "$DTNAME seems already installed - $DTCONFIG found"
+
+    check_deps
+   
+    # check for domain.conf in current folder
+    [ -e "$DTTEMPLATE_NAME" ] || exit_error "$DTTEMPLATE_NAME template could not be found in $PWD"
+
+    echo
+    echo "You are about to install $DTNAME that provides a simple CLI for virtualhost management"
+    echo "for Apache. It is able to add and remove virtual hosts. For each virtual host it"
+    echo "bootstraps a clean database with a new database user. This installation tries to set"
+    echo "up everything so you can just start using it. For this it needs a bit of your input."
+    echo "The configuration will be stored at $DTCONFIG if you would like to change it."
+    echo
+
+    # ask for configuration
+    while [ -d $DTPATH ]; do 
+        DTPATH=$(ask "Virtualhosts root folder" "$DEF_DTPATH")
+        if [ -f "$DTPATH" ]; then
+            echo "Error: $DTPATH is a file"
+            DTPATH=
+            continue
+        fi
+        if [ -d "$DTPATH" ]; then
+            if [ "$(find $DTPATH -maxdepth 1 | wc -l)" -ne 1 ]; then
+                echo "Error: $DTPATH is not empty folder"
+                DTPATH=
+                continue
+            fi
+        fi
+        break
+    done
+    DTMYUSER=$(ask "MySQL admin user for creating/deleting users")
+    DTMYPASS=$(ask "MySQL admin user password")
+    DTAPACHEDIR=$(ask "Apache configuration directory" "$DEF_DTAPACHEDIR")
+    DTBASICAUTH=$(ask "Password file for basic authentication" "$DEF_DTBASICAUTH")
+    DTBASICUSER=$(ask "User for basic authentication")
+    DTBASICPASS=$(ask "Password for $DTBASICUSER")
+
+    # write configuration file
+    mkdir -p $(dirname $DTCONFIG)
+    print_info "Creating configuration file $DTNAME"
+    {
+        echo "# This is configuration file for $DTNAME"
+        echo
+        echo "# Virtualhosts base directory"
+        echo "DTPATH=\"$DTPATH\""
+        echo
+        echo "# Apache configuration directory"
+        echo "DTAPACHEDIR=\"$DTAPACHEDIR\""
+        echo
+        echo "# MySQL username for managing database users"
+        echo "DTMYUSER=\"$DTMYUSER\""
+        echo
+        echo "# MySQL password for $DTMYUSER"
+        echo "DTMYPASS=\"$DTMYPASS\""
+        echo
+        echo "# Basic auth password file"
+        echo "DTBASICAUTH=\"$DTBASICAUTH\""
+    } > $DTCONFIG
+    chmod 700 $(dirname $DTCONFIG)
+    chmod 600 $DTCONFIG
+   
+    # create DTPATH
+    [ -e "$DTPATH" ] || mkdir -p $DTPATH
+
+    # copy template
+    mkdir -p $(dirname $DTTEMPLATE)
+    cp ${DTTEMPLATE_NAME} $DTTEMPLATE
+
+    # setup virtualhosts
+    DTENABLED_SITES=${DTAPACHEDIR}/${ENABLED_SITES}
+    DTDISABLED_SITES=${DTAPACHEDIR}/${DISABLED_SITES}
+    print_info "Setting up virtual hosts" 
+    cat > ${DTAPACHEDIR}/conf.d/domaintool.conf << EOF
+NameVirtualHost *:80
+IncludeOptional ${DTENABLED_SITES}/*.conf
+EOF
+    mkdir -p ${DTENABLED_SITES}
+    mkdir -p ${DTDISABLED_SITES}
+
+    # reload apache
+    $APACHECTL graceful || exit_error "Problem restarting apache, invalid config?"
+
+    # copy domaintool to /usr/sbin
+    print_info "Installing domaintool to $INSTALL_PATH"
+    cp -f domaintool $INSTALL_PATH
+}
+
+
+print_help() {
+    echo "Usage: $(basename $0) operation domain"
+    echo "Simple virtualhost management script."
+    echo 
+    echo "Available operations:"
+    echo " create   - Creates new domain"
+    echo " enable   - Enables domain"
+    echo " enauth   - Enables basic auth on domain"
+    echo " disable  - Disables domain"
+    echo " disauth  - Disables basic auth on domain"
+    [ -e "$DTCONFIG" ] || echo " install  - Install $DNAME"
+    echo " list     - List available domains"
+    echo " remove   - Completely removes domain (use with caution!)"
+    echo "            The removed sites are moved to $DTPATH/removed folder"
+}
+
+print_info() {
+    echo ":: $1"
+}
+
+reload_apache() {
+    print_info "Reloading apache"
+    $APACHECTL graceful
+}
+
+check_domain() {
+    [ -e "$DTPATH/$DTDOMAIN" ] || \
+        exit_error "Sorry the domain $DTDOMAIN does not exist!"
+}
+
+operation_list() {
+    local DIR
+    local ALL=$(ls -d /data/www/*/sub 2>/dev/null)
+    if [ "$ALL" = "" ]; then
+        echo "No domains available"
+        exit 0
+    fi
+    print_info "Available domains"
+    for DIR in $ALL; do 
+        local DOM=$(basename $(dirname $DIR))
+        PDOM=$DOM
+        [ -e $DTENABLED_SITES/${DOM}.conf ] || PDOM="$PDOM (disabled)"
+        egrep -q "^.[^#]*Require all granted" $DTENABLED_SITES/${DOM}.conf \
+            $DTDISABLED_SITES/${DOM}.conf 2>/dev/null || PDOM="$PDOM (basic_auth)"
+        echo $PDOM
+    done 
+}
+
+
+operation_remove() {
+    local ANSWER DBNAME
+
+    check_domain
+
+    echo -n "Are you sure you want to completely remove $DTDOMAIN and it's database? (y/n) "
+    read ANSWER
+    if [ "$ANSWER" = "yes" ] || [ "$ANSWER" = "y" ]; then
+        print_info "Removing domain $DTDOMAIN"
+        rm -f $DTENABLED_SITES/${DTDOMAIN}.conf
+        rm -f $DTDISABLED_SITES/${DTDOMAIN}.conf
+
+        # reload apache
+        reload_apache
+
+        rm -rf $DTPATH/$DTDOMAIN
+
+        # DTDOMAIN name can be at most 16 chars 
+        # also sanitize and remove all fullstops
+        DBNAME=$(echo $DTDOMAIN | sed 's/\.//g')
+        DBNAME=${DBNAME:0:15}
+
+        echo "DROP DATABASE \`$DBNAME\`;" | mysql -u $DTMYUSER -p$DTMYPASS || \
+            exit_error "Could not drop database $DBNAME"
+        echo "DROP USER '$DBNAME'@'localhost';" | mysql -u $DTMYUSER -p$DTMYPASS || \
+            exit_error "Could not remove user $USER"
+    fi
+
+}
+
+operation_disable() {
+    check_domain
+
+    print_info "Disabling domain $DTDOMAIN"
+
+    # disable site
+    mv ${DTENABLED_SITES}/${DTDOMAIN}.conf ${DTDISABLED_SITES}/
+
+    # reload apache
+    reload_apache
+}
+
+operation_enable() {
+    check_domain
+
+    print_info "Enabling domain $DTDOMAIN"
+
+    # enable site
+    mv ${DTDISABLED_SITES}/${DTDOMAIN}.conf ${DTENABLED_SITES}/
+
+    # reload apache
+    reload_apache
+}
+
+operation_enauth() {
+    check_domain
+
+    local APACHECONF="${DTENABLED_SITES}/${DTDOMAIN}.conf"
+
+    egrep -q "^[ \t]*Require valid-user" $APACHECONF
+    if [ $? -eq 0 ]; then
+        print_info "Basic auth on $DTDOMAIN already enabled"
+        exit 1
+    fi
+
+    print_info "Enabling basic auth on $DTDOMAIN"
+    sed -i "s/.*Require all granted/        Require valid-user/g" $APACHECONF
+
+    # reload apache
+    reload_apache
+}
+
+operation_disauth() {
+    check_domain
+
+    local APACHECONF="${DTENABLED_SITES}/${DTDOMAIN}.conf"
+
+    egrep -q "^[ \t]*Require all granted" $APACHECONF
+    if [ $? -eq 0 ]; then
+        print_info "Basic auth on $DTDOMAIN already disabled"
+        exit 1
+    fi
+
+    print_info "Disabling basic auth on $DTDOMAIN"
+    sed -i "s/.*Require.*valid-user/        Require all granted/g" $APACHECONF
+
+    # reload apache
+    reload_apache
+}
+
+# Generate a random password
+#  $1 = number of characters; defaults to 32
+#  $2 = include special characters; 1 = yes, 0 = no; defaults to 1
+randpass() {
+    local CHAR
+
+    [ "$2" == "0" ] && CHAR="[:alnum:]" || CHAR="[:graph:]"
+    cat /dev/urandom | tr -cd "$CHAR" | head -c ${1:-32}
+    echo
+}
+
+# creates new domain
+operation_create() {
+    # check if domain name unused
+    if [ -e "$DTPATH/$DTDOMAIN" ]; then
+        echo "Sorry $DTDOMAIN already exists!"
+        exit 1
+    fi
+    print_info "Creating domain $DTDOMAIN"
+
+    # create directories
+    mkdir -p $DTPATH/$DTDOMAIN/logs
+    mkdir -p $DTPATH/$DTDOMAIN/sub
+    mkdir -p $DTPATH/$DTDOMAIN/www
+
+    # copy apache config
+    local APACHECONF="$DTAPACHEDIR/domaintool-sites/${DTDOMAIN}.conf"
+    cp -f $DTTEMPLATE $APACHECONF
+
+    # setup template
+    sed -i "s|WDOMAIN|$DTDOMAIN|g" $APACHECONF
+    sed -i "s|WBASEDIR|$DTPATH|g" $APACHECONF
+    sed -i "s|WBASICPASS|$DTBASICAUTH|g" $APACHECONF
+
+    # DTDOMAIN name can be at most 16 chars 
+    # also sanitize and remove all fullstops
+    DBNAME=$(echo $DTDOMAIN | sed 's/\.//g')
+    DBNAME=${DBNAME:0:15}
+
+    # create query
+    TMP=`mktemp`
+    PASS=$(randpass 12 0)
+
+    # create new database
+    print_info "Adding mysql user and database \"$DBNAME\" with password \"$PASS\""
+    
+    echo "CREATE USER '$DBNAME'@'localhost' IDENTIFIED BY '$PASS';
+    GRANT USAGE ON * . * TO '$DBNAME'@'localhost' IDENTIFIED BY '$PASS' WITH MAX_QUERIES_PER_HOUR 0 MAX_CONNECTIONS_PER_HOUR 0 MAX_UPDATES_PER_HOUR 0 MAX_USER_CONNECTIONS 0 ;
+    CREATE DATABASE IF NOT EXISTS \`$DBNAME\` DEFAULT CHARACTER SET utf8 COLLATE utf8_general_ci;
+    GRANT ALL PRIVILEGES ON \`$DBNAME\` . * TO '$DBNAME'@'localhost';" > $TMP
+
+    cat $TMP | mysql -u $DTMYUSER -p$DTMYPASS
+    if [ $? -ne 0 ]; then
+        exit_error "Cannot create user and database!"
+    fi
+    rm -f $TMP
+
+    print_info "Please point DNS A record of $DTDOMAIN to $(curl -s ifconfig.me)."
+}
+
+# get options
+while getopts "h" flag; do
+  case $flag in
+    h)
+      print_help
+      exit 0
+      ;;
+  esac
+done
+shift $(( OPTIND - 1 ));
+
+# sanity checks
+sanity_checks
+
+# call operation
+if [ "$(type -t operation_$DTOP)" = function ]; then
+    operation_$DTOP
+else
+    echo "Unknown operation $DTOP!"
+    echo
+    print_help
+    exit 1
+fi
+
+# vim: ts=4 sw=4 sts=4 ft=sh et ai:
